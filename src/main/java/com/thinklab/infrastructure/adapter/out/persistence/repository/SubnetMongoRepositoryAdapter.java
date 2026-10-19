@@ -30,6 +30,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -135,9 +136,13 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
         return Mono.from(getCollection().updateOne(Filters.and(Filters.eq(FIELD_ID, subnet.getId()), Filters.eq(FIELD_STATUS, SubnetStatus.ACTIVE.name())), update));
     }
 
-    /** The order that decides which of two overlapping new subnets stays: the one created first, and on a tie the smaller id. */
+    /**
+     * The order that decides which of two overlapping new subnets stays: the one created first, and on a tie the smaller id. Times are compared
+     * to the millisecond, the precision of the store: one subnet's own time in memory is finer than the times it reads back, and comparing those
+     * as they are let two subnets created in the same millisecond each find the other earlier, and both leave.
+     */
     static boolean isEarlier(Subnet other, Subnet subnet) {
-        int byTime = other.getCreatedAt().compareTo(subnet.getCreatedAt());
+        int byTime = other.getCreatedAt().truncatedTo(ChronoUnit.MILLIS).compareTo(subnet.getCreatedAt().truncatedTo(ChronoUnit.MILLIS));
         return byTime < 0 || (byTime == 0 && other.getId().compareTo(subnet.getId()) < 0);
     }
 

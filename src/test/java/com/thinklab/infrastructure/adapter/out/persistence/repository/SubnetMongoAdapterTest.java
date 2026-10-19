@@ -173,6 +173,10 @@ class SubnetMongoAdapterTest {
         assertTrue(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, small), subnet("10.0.0.0/24", now, large)));
         assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, large), subnet("10.0.0.0/24", now, small)));
         assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now.plusSeconds(1), small), subnet("10.0.0.0/24", now, large)));
+        Instant precise = now.plusNanos(900_000);
+        assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now.plusNanos(400_000).truncatedTo(java.time.temporal.ChronoUnit.MILLIS), large),
+                subnet("10.0.0.0/24", precise, small)), "the same millisecond, read back from the store, is a tie decided by the id");
+        assertTrue(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, small), subnet("10.0.0.0/24", precise, large)));
     }
 
     @Test

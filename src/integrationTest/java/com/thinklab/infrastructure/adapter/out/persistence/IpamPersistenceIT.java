@@ -78,7 +78,7 @@ class IpamPersistenceIT implements TestPropertyProvider {
     }
 
     @Test
-    @DisplayName("an overlapping range is refused, a retired one does not count, and of twenty overlapping creations at once exactly one survives")
+    @DisplayName("an overlapping range is refused, a retired one does not count, and of twenty creations at once of ranges that all overlap each other exactly one survives")
     void overlaps() {
         UUID organisation = UUID.randomUUID();
         Subnet wide = subnets.create(newSubnet(organisation, "Wide", "10.20.0.0/16")).block();
@@ -92,7 +92,7 @@ class IpamPersistenceIT implements TestPropertyProvider {
 
         UUID racing = UUID.randomUUID();
         List<Boolean> outcomes = Flux.range(0, 20)
-                .flatMap(i -> subnets.create(newSubnet(racing, "Race " + i, i % 2 == 0 ? "172.16.0.0/16" : "172.16." + i + ".0/24"))
+                .flatMap(i -> subnets.create(newSubnet(racing, "Race " + i, i % 2 == 0 ? "172.16.0.0/16" : "172.16.0.0/" + (16 + i % 8)))
                         .map(created -> true).onErrorResume(DuplicateSubnetException.class, lost -> Mono.just(false)).subscribeOn(Schedulers.parallel()), 20)
                 .collectList().block();
         assertEquals(1, outcomes.stream().filter(won -> won).count());
