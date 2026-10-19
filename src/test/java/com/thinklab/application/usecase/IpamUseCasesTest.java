@@ -214,7 +214,7 @@ class IpamUseCasesTest {
     }
 
     @Test
-    @DisplayName("without an address the lowest free one is taken; if somebody takes it first the next free one is tried")
+    @DisplayName("without an address the lowest free one is taken; if somebody takes it first, a free one among the lowest is tried")
     void allocateNextFree() {
         Subnet subnet = subnet("Office", "10.20.0.0/24");
         when(subnets.findById(subnet.getId(), org)).thenReturn(Mono.just(subnet));
@@ -225,7 +225,10 @@ class IpamUseCasesTest {
         InitiateAllocationUseCase useCase = new InitiateAllocationUseCase(hash, subnets, allocations);
 
         StepVerifier.create(useCase.execute(org, new InitiateAllocationRequest(subnet.getId(), null, null, null), "op", STAFF))
-                .assertNext(response -> assertEquals("10.20.0.5", response.ip())).verifyComplete();
+                .assertNext(response -> {
+                    long address = Ipv4.parse(response.ip());
+                    assertTrue(address >= Ipv4.parse("10.20.0.5") && address < Ipv4.parse("10.20.0.5") + InitiateAllocationUseCase.SPREAD, response.ip());
+                }).verifyComplete();
         ArgumentCaptor<Allocation> tried = ArgumentCaptor.forClass(Allocation.class);
         verify(allocations, times(2)).create(tried.capture());
         assertEquals("10.20.0.3", tried.getAllValues().get(0).getIp());
@@ -249,14 +252,14 @@ class IpamUseCasesTest {
     }
 
     @Test
-    @DisplayName("the lowest free address skips the held ones, ignores held ones above it, and is null when the subnet is full")
+    @DisplayName("the lowest free addresses skip the held ones, stop at the count, and are none when the subnet is full")
     void lowestFree() {
         Subnet subnet = subnet("Office", "10.20.0.0/29");
-        assertEquals(Ipv4.parse("10.20.0.1"), InitiateAllocationUseCase.lowestFree(subnet, List.of()));
-        assertEquals(Ipv4.parse("10.20.0.2"), InitiateAllocationUseCase.lowestFree(subnet, List.of(Ipv4.parse("10.20.0.1"), Ipv4.parse("10.20.0.5"))));
-        assertEquals(Ipv4.parse("10.20.0.1"), InitiateAllocationUseCase.lowestFree(subnet, List.of(Ipv4.parse("10.20.0.3"))));
-        List<Long> all = List.of(1L, 2L, 3L, 4L, 5L, 6L).stream().map(n -> Ipv4.parse("10.20.0.0") + n).toList();
-        assertNull(InitiateAllocationUseCase.lowestFree(subnet, all));
+        long base = Ipv4.parse("10.20.0.0");
+        assertEquals(List.of(base + 1, base + 2, base + 3), InitiateAllocationUseCase.lowestFree(subnet, List.of(), 3));
+        assertEquals(List.of(base + 2, base + 3, base + 4, base + 6), InitiateAllocationUseCase.lowestFree(subnet, List.of(base + 1, base + 5), 10));
+        assertEquals(List.of(base + 1, base + 2, base + 4, base + 5, base + 6), InitiateAllocationUseCase.lowestFree(subnet, List.of(base + 3), 10));
+        assertEquals(List.of(), InitiateAllocationUseCase.lowestFree(subnet, List.of(base + 1, base + 2, base + 3, base + 4, base + 5, base + 6), 10));
     }
 
     @Test

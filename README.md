@@ -8,7 +8,7 @@ address is never held twice, and says, **when you ask**, how full each subnet is
 
 ## What it guarantees, and what it does not
 
-- **The registry hands addresses out** (ADR-030): ask for an address, or leave it out and the lowest free one is taken. The network and broadcast
+- **The registry hands addresses out** (ADR-030): ask for an address, or leave it out and the lowest free one is taken (after a lost race, a random free one among the 64 lowest). The network and broadcast
   addresses are never handed out. IPv4 only, dotted quads only (no leading zeros). A hostname must be a DNS name; nothing about a person is kept.
 - **No overlap, no double allocation** (ADR-033): an address is held by one ALLOCATED allocation at most (a partial unique index: twenty requests
   at once give one winner, 409 for the others); no two ACTIVE subnets of a tenant overlap (settled after the write: of twenty overlapping
