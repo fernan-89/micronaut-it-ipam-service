@@ -11,7 +11,7 @@ address is never held twice, and says, **when you ask**, how full each subnet is
 - **The registry hands addresses out** (ADR-030): ask for an address, or leave it out and the lowest free one is taken (after a lost race, a random free one among the 64 lowest). The network and broadcast
   addresses are never handed out. IPv4 only, dotted quads only (no leading zeros). A hostname must be a DNS name; nothing about a person is kept.
 - **No overlap, no double allocation** (ADR-033): an address is held by one ALLOCATED allocation at most (a partial unique index: twenty requests
-  at once give one winner, 409 for the others); no two ACTIVE subnets of a tenant overlap (settled after the write: of twenty overlapping
+  at once give one winner, 409 for the others); no two ACTIVE subnets of a tenant overlap (settled after the write, by an order the store gives: of twenty overlapping
   creations at once exactly one survives). A released address can be handed out again.
 - **A subnet is judged when read** (ADR-031): `level` is `OK`, `NEAR_FULL` (from `warnPercent` of the usable addresses on), `FULL` (nothing
   free) or `RETIRED`, with `used`, `usable`, `free` and `usedPercent`.

@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * IP address management against a real MongoDB: the unique subnet name, overlapping ranges settled after the write (one survivor out of twenty
+ * IP address management against a real MongoDB: the unique subnet name, overlapping ranges settled after the write by the store's own order (one survivor out of twenty
  * simultaneous creations), a reactivation undone when its range is taken, one holder per address (one winner out of twenty simultaneous requests),
  * a released address handed out again, the held addresses counted and listed, and the indexes created at startup.
  */
@@ -97,6 +97,34 @@ class IpamPersistenceIT implements TestPropertyProvider {
                 .collectList().block();
         assertEquals(1, outcomes.stream().filter(won -> won).count());
         assertEquals(1, subnets.findAll(racing).count().block());
+    }
+
+    @Test
+    @DisplayName("the order is the store's, not the clock of the caller: a subnet created earlier in memory that reaches the store later does not stay beside one that is already there")
+    void orderIsTheStores() {
+        UUID organisation = UUID.randomUUID();
+        Subnet createdFirst = newSubnet(organisation, "Created first", "10.50.0.0/16");
+        Subnet createdSecond = newSubnet(organisation, "Created second", "10.50.1.0/24");
+        assertTrue(createdFirst.getCreatedAt().isBefore(createdSecond.getCreatedAt()) || createdFirst.getCreatedAt().equals(createdSecond.getCreatedAt()));
+
+        subnets.create(createdSecond).block();
+        assertThrows(DuplicateSubnetException.class, () -> subnets.create(createdFirst).block());
+
+        assertEquals(List.of("Created second"), subnets.findAll(organisation).map(Subnet::getName).collectList().block());
+    }
+
+    @Test
+    @DisplayName("thirty rounds of twenty creations at once of ranges that all overlap each other: every round leaves exactly one")
+    void manyRounds() {
+        for (int round = 0; round < 30; round++) {
+            UUID racing = UUID.randomUUID();
+            List<Boolean> outcomes = Flux.range(0, 20)
+                    .flatMap(i -> subnets.create(newSubnet(racing, "Race " + i, i % 2 == 0 ? "172.16.0.0/16" : "172.16.0.0/" + (16 + i % 8)))
+                            .map(created -> true).onErrorResume(DuplicateSubnetException.class, lost -> Mono.just(false)).subscribeOn(Schedulers.parallel()), 20)
+                    .collectList().block();
+            assertEquals(1, outcomes.stream().filter(won -> won).count(), "round " + round);
+            assertEquals(1, subnets.findAll(racing).count().block(), "round " + round);
+        }
     }
 
     @Test

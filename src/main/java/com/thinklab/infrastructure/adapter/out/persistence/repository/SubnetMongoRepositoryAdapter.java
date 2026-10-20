@@ -2,8 +2,11 @@ package com.thinklab.infrastructure.adapter.out.persistence.repository;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoServerException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.Sorts;
 import com.mongodb.client.result.UpdateResult;
 import com.mongodb.client.model.Updates;
@@ -20,6 +23,7 @@ import com.thinklab.infrastructure.adapter.out.persistence.entity.SubnetDocument
 import com.thinklab.infrastructure.adapter.out.persistence.entity.SubnetDocument.SubnetPersistenceMapper;
 import io.micronaut.context.annotation.Property;
 import jakarta.inject.Singleton;
+import org.bson.Document;
 import org.bson.codecs.configuration.CodecRegistries;
 import org.bson.codecs.configuration.CodecRegistry;
 import org.bson.codecs.pojo.PojoCodecProvider;
@@ -29,18 +33,19 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
-import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
 /**
  * MongoDB Reactive Repository Adapter for the Subnet aggregate, raw reactive-streams driver. Every change is one atomic update guarded by the
  * status loaded (ADR-033) that also appends the audit entry; a name unique per organisation is a unique index. A range cannot be a unique index,
- * so overlaps are settled after the write: a new subnet that overlaps an ACTIVE one is removed again unless it is the earlier of the two (by
- * creation time, then id), which leaves exactly one of any number of simultaneous creations; a reactivated subnet that overlaps an ACTIVE one goes
- * back to RETIRED.
+ * so overlaps are settled after the write, by an order the STORE gives (ADR-033): once a new subnet is inserted it takes a ticket from an atomic
+ * counter of the organisation and keeps it; of two overlapping subnets the one with the lower ticket stays, so exactly one of any number of
+ * simultaneous creations survives. The order is not the creation time in the caller's memory: that is taken before the write, and a subnet created
+ * earlier that reaches the store later was not seen by one created later that had already looked (found by the live smoke). A reactivated subnet that
+ * overlaps an ACTIVE one goes back to RETIRED.
  */
 @Singleton
 public class SubnetMongoRepositoryAdapter implements SubnetRepository {
@@ -52,6 +57,12 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
     private static final String FIELD_ID = "_id";
     private static final String FIELD_ORGANISATION = "organisationId";
     private static final String FIELD_STATUS = "status";
+    private static final String FIELD_SEQUENCE = "sequence";
+    static final String SEQUENCES_COLLECTION = "subnet_sequences";
+    /** A subnet that has no ticket yet and was created within this long is being created right now: its place in the order is still to be decided. */
+    static final Duration IN_FLIGHT = Duration.ofSeconds(5);
+    static final Duration SETTLE_POLL = Duration.ofMillis(20);
+    static final int SETTLE_ATTEMPTS = 250;
 
     private static final CodecRegistry POJO_CODEC_REGISTRY = CodecRegistries.fromRegistries(
             MongoClientSettings.getDefaultCodecRegistry(),
@@ -61,10 +72,23 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
     private final MongoClient mongoClient;
     private final String database;
 
+    private final Duration settlePoll;
+    private final int settleAttempts;
+
     public SubnetMongoRepositoryAdapter(MongoClient mongoClient, @Property(name = "mongodb.uri") String mongoUri) {
+        this(mongoClient, mongoUri, SETTLE_POLL, SETTLE_ATTEMPTS);
+    }
+
+    SubnetMongoRepositoryAdapter(MongoClient mongoClient, String mongoUri, Duration settlePoll, int settleAttempts) {
+        this.settlePoll = settlePoll;
+        this.settleAttempts = settleAttempts;
         this.mongoClient = mongoClient;
         String configured = new ConnectionString(Objects.requireNonNull(mongoUri, "mongodb.uri cannot be null.")).getDatabase();
         this.database = configured != null ? configured : DEFAULT_DATABASE;
+    }
+
+    private MongoCollection<Document> getSequences() {
+        return mongoClient.getDatabase(database).getCollection(SEQUENCES_COLLECTION);
     }
 
     private MongoCollection<SubnetDocument> getCollection() {
@@ -76,15 +100,37 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
         log.debug("[PERSISTENCE] Monolithic create for Subnet Aggregate: {}", subnet.getId());
         return Mono.from(getCollection().insertOne(SubnetPersistenceMapper.toDocument(subnet)))
                 .onErrorMap(MongoWriteException.class, error -> duplicate(error, subnet))
-                .then(overlapping(subnet).collectList())
-                .flatMap(others -> {
-                    List<Subnet> earlier = others.stream().filter(other -> isEarlier(other, subnet)).toList();
-                    if (earlier.isEmpty()) {
-                        return Mono.just(subnet);
-                    }
-                    return Mono.from(getCollection().deleteOne(Filters.eq(FIELD_ID, subnet.getId())))
-                            .then(Mono.error(overlap(subnet, earlier.get(0))));
-                });
+                .then(Mono.defer(() -> takeTicket(subnet.getOrganisationId())))
+                .flatMap(ticket -> Mono.from(getCollection().updateOne(Filters.eq(FIELD_ID, subnet.getId()), Updates.set(FIELD_SEQUENCE, ticket))).thenReturn(ticket))
+                .flatMap(ticket -> settle(subnet, ticket, settleAttempts));
+    }
+
+    /** The next ticket of the organisation: one atomic increment, the same order for every instance. The counter is created by the first one; if two create it at once, the loser asks again. */
+    private Mono<Long> takeTicket(UUID organisationId) {
+        Mono<Long> next = Mono.defer(() -> Mono.from(getSequences().findOneAndUpdate(Filters.eq(FIELD_ID, organisationId), Updates.inc("value", 1L),
+                        new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER))).map(counter -> counter.getLong("value")));
+        return next.onErrorResume(error -> error instanceof MongoServerException server && server.getCode() == DUPLICATE_KEY, error -> next);
+    }
+
+    /**
+     * Decides, after the write and the ticket, whether the new subnet stays. The ACTIVE subnets that touch it are read: a subnet created in the last few
+     * seconds that has no ticket yet is still being created, so the read is repeated until it has one (it needs nothing from this subnet to get it, so
+     * nobody waits for each other); then the subnet leaves, removing itself and answering a duplicate, if any of them has a lower ticket. A subnet without a
+     * ticket that is not being created is older than every ticket (created before tickets existed, or abandoned) and also comes first.
+     */
+    private Mono<Subnet> settle(Subnet subnet, long ticket, int attemptsLeft) {
+        return overlappingDocuments(subnet).collectList().flatMap(others -> {
+            if (attemptsLeft > 0 && others.stream().anyMatch(other -> other.getSequence() == null && inFlight(other))) {
+                return Mono.delay(settlePoll).then(Mono.defer(() -> settle(subnet, ticket, attemptsLeft - 1)));
+            }
+            return others.stream().filter(other -> other.getSequence() == null || other.getSequence() < ticket).findFirst()
+                    .map(first -> Mono.from(getCollection().deleteOne(Filters.eq(FIELD_ID, subnet.getId()))).<Subnet>then(Mono.error(overlap(subnet, SubnetPersistenceMapper.toDomain(first)))))
+                    .orElseGet(() -> Mono.just(subnet));
+        });
+    }
+
+    private static boolean inFlight(SubnetDocument document) {
+        return document.getCreatedAt().isAfter(Instant.now().minus(IN_FLIGHT));
     }
 
     @Override
@@ -122,11 +168,15 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
                 .flatMap(other -> undoReactivation(subnet, auditEntry).then(Mono.<Void>error(overlap(subnet, other))));
     }
 
-    /** The ACTIVE subnets of the tenant, other than this one, that share at least one address with it. */
-    private Flux<Subnet> overlapping(Subnet subnet) {
+    /** The ACTIVE subnets of the tenant, other than this one, that share at least one address with it, as stored. */
+    private Flux<SubnetDocument> overlappingDocuments(Subnet subnet) {
         Bson filter = Filters.and(Filters.eq(FIELD_ORGANISATION, subnet.getOrganisationId()), Filters.eq(FIELD_STATUS, SubnetStatus.ACTIVE.name()),
                 Filters.ne(FIELD_ID, subnet.getId()), Filters.lte("network", subnet.getBroadcast()), Filters.gte("broadcast", subnet.getNetwork()));
-        return Flux.from(getCollection().find(filter)).map(SubnetPersistenceMapper::toDomain);
+        return Flux.from(getCollection().find(filter));
+    }
+
+    private Flux<Subnet> overlapping(Subnet subnet) {
+        return overlappingDocuments(subnet).map(SubnetPersistenceMapper::toDomain);
     }
 
     private Mono<UpdateResult> undoReactivation(Subnet subnet, SubnetAuditEntry reactivation) {
@@ -134,16 +184,6 @@ public class SubnetMongoRepositoryAdapter implements SubnetRepository {
                 Updates.push("auditTrail", new AuditEntryDocument(Instant.now(), "REACTIVATION_UNDONE", reactivation.executor(), SubnetStatus.ACTIVE.name(),
                         SubnetStatus.RETIRED.name(), "Reactivation undone: the range overlaps an active subnet.")));
         return Mono.from(getCollection().updateOne(Filters.and(Filters.eq(FIELD_ID, subnet.getId()), Filters.eq(FIELD_STATUS, SubnetStatus.ACTIVE.name())), update));
-    }
-
-    /**
-     * The order that decides which of two overlapping new subnets stays: the one created first, and on a tie the smaller id. Times are compared
-     * to the millisecond, the precision of the store: one subnet's own time in memory is finer than the times it reads back, and comparing those
-     * as they are let two subnets created in the same millisecond each find the other earlier, and both leave.
-     */
-    static boolean isEarlier(Subnet other, Subnet subnet) {
-        int byTime = other.getCreatedAt().truncatedTo(ChronoUnit.MILLIS).compareTo(subnet.getCreatedAt().truncatedTo(ChronoUnit.MILLIS));
-        return byTime < 0 || (byTime == 0 && other.getId().compareTo(subnet.getId()) < 0);
     }
 
     private static DuplicateSubnetException overlap(Subnet subnet, Subnet other) {
