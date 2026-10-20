@@ -30,6 +30,7 @@ public class SubnetDocument {
     private String status;
     private Instant createdAt;
     private Instant updatedAt;
+    private Long sequence;
     private List<AuditEntryDocument> auditTrail = new ArrayList<>();
 
     public UUID getId() { return id; }
@@ -58,6 +59,8 @@ public class SubnetDocument {
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
+    public Long getSequence() { return sequence; }
+    public void setSequence(Long sequence) { this.sequence = sequence; }
     public List<AuditEntryDocument> getAuditTrail() { return auditTrail; }
     public void setAuditTrail(List<AuditEntryDocument> auditTrail) { this.auditTrail = auditTrail; }
 

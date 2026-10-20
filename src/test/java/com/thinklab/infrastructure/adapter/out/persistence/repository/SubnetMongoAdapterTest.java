@@ -1,9 +1,11 @@
 package com.thinklab.infrastructure.adapter.out.persistence.repository;
 
+import com.mongodb.MongoCommandException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.ServerAddress;
 import com.mongodb.WriteError;
 import com.mongodb.client.result.DeleteResult;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.result.InsertOneResult;
 import com.mongodb.client.result.UpdateResult;
 import com.mongodb.reactivestreams.client.FindPublisher;
@@ -18,6 +20,9 @@ import com.thinklab.domain.model.Subnet.SubnetStatus;
 import com.thinklab.infrastructure.adapter.out.persistence.entity.SubnetDocument;
 import com.thinklab.infrastructure.adapter.out.persistence.entity.SubnetDocument.SubnetPersistenceMapper;
 import org.bson.BsonDocument;
+import org.bson.BsonInt32;
+import org.bson.BsonString;
+import org.bson.Document;
 import org.bson.BsonObjectId;
 import org.bson.conversions.Bson;
 import org.bson.types.ObjectId;
@@ -31,6 +36,7 @@ import reactor.test.StepVerifier;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -56,6 +62,7 @@ class SubnetMongoAdapterTest {
     private final UUID org = UUID.randomUUID();
     private MongoClient client;
     private MongoCollection<SubnetDocument> collection;
+    private MongoCollection<Document> sequences;
 
     @BeforeEach
     void setUp() {
@@ -66,6 +73,10 @@ class SubnetMongoAdapterTest {
         when(client.getDatabase("thinklab_it_ipam_db")).thenReturn(database);
         when(database.getCollection("subnets", SubnetDocument.class)).thenReturn(collection);
         when(collection.withCodecRegistry(any())).thenReturn(collection);
+        sequences = mock(MongoCollection.class);
+        when(database.getCollection("subnet_sequences")).thenReturn(sequences);
+        when(sequences.findOneAndUpdate(any(Bson.class), any(Bson.class), any(FindOneAndUpdateOptions.class))).thenReturn(Mono.just(new Document("value", 5L)));
+        when(collection.updateOne(any(Bson.class), any(Bson.class))).thenReturn(Mono.just(UpdateResult.acknowledged(1, 1L, null)));
         when(collection.insertOne(any(SubnetDocument.class))).thenReturn(Mono.just(InsertOneResult.acknowledged(new BsonObjectId(new ObjectId()))));
         when(collection.deleteOne(any(Bson.class))).thenReturn(Mono.just(DeleteResult.acknowledged(1)));
     }
@@ -104,6 +115,33 @@ class SubnetMongoAdapterTest {
         }
     }
 
+    /** A stored subnet with the ticket the store gave it (null: none yet or none ever). */
+    private SubnetDocument stored(Subnet subnet, Long ticket) {
+        SubnetDocument document = SubnetPersistenceMapper.toDocument(subnet);
+        document.setSequence(ticket);
+        return document;
+    }
+
+    /** Each find answers the next list of stored subnets. */
+    private void findsStored(List<SubnetDocument>... answers) {
+        List<FindPublisher<SubnetDocument>> publishers = new ArrayList<>();
+        for (List<SubnetDocument> answer : answers) {
+            FindPublisher<SubnetDocument> publisher = mock(FindPublisher.class);
+            when(publisher.first()).thenReturn(publisher);
+            when(publisher.sort(any(Bson.class))).thenReturn(publisher);
+            doAnswer(invocation -> {
+                org.reactivestreams.Subscriber<SubnetDocument> subscriber = invocation.getArgument(0);
+                Flux.fromIterable(answer).subscribe(subscriber);
+                return null;
+            }).when(publisher).subscribe(any());
+            publishers.add(publisher);
+        }
+        var stub = when(collection.find(any(Bson.class)));
+        for (FindPublisher<SubnetDocument> publisher : publishers) {
+            stub = stub.thenReturn(publisher);
+        }
+    }
+
     @Test
     @DisplayName("a subnet survives the round trip with its range as numbers and text; the document setters are plain and the mapper a utility class")
     void roundTrip() throws ReflectiveOperationException {
@@ -128,6 +166,8 @@ class SubnetMongoAdapterTest {
         assertEquals("10.20.0.0/24", back.getCidr());
         assertEquals(2, back.getAuditTrail().size());
         assertEquals(SubnetStatus.ACTIVE, back.getAuditTrail().get(1).fromStatus());
+        document.setSequence(7L);
+        assertEquals(7L, document.getSequence());
         document.setSiteId(null);
         document.setAuditTrail(new ArrayList<>());
         assertTrue(document.getAuditTrail().isEmpty());
@@ -137,11 +177,11 @@ class SubnetMongoAdapterTest {
     }
 
     @Test
-    @DisplayName("a subnet that overlaps nothing, or only later ones, stays; the overlap query is the tenant's active ranges that touch it")
+    @DisplayName("a new subnet takes a ticket from the organisation's atomic counter and keeps it; one that overlaps nothing, or only later tickets, stays; the overlap query is the tenant's active ranges that touch it")
     void createStays() {
-        Instant now = Instant.parse("2026-10-19T10:00:00Z");
+        Instant now = Instant.now();
         Subnet subnet = subnet("10.20.0.0/24", now, UUID.randomUUID());
-        finds(List.of(), List.of(subnet("10.20.0.0/16", now.plusSeconds(1), UUID.randomUUID())));
+        findsStored(List.of(), List.of(stored(subnet("10.20.0.0/16", now.plusSeconds(1), UUID.randomUUID()), 9L)));
         SubnetMongoRepositoryAdapter adapter = new SubnetMongoRepositoryAdapter(client, URI);
 
         StepVerifier.create(adapter.create(subnet)).expectNext(subnet).verifyComplete();
@@ -152,31 +192,75 @@ class SubnetMongoAdapterTest {
         verify(collection, times(2)).find(filter.capture());
         String text = filter.getAllValues().get(0).toString();
         assertTrue(text.contains("network") && text.contains("broadcast") && text.contains("ACTIVE") && text.contains("organisationId"));
+        ArgumentCaptor<Bson> ticket = ArgumentCaptor.forClass(Bson.class);
+        verify(collection, times(2)).updateOne(any(Bson.class), ticket.capture());
+        assertTrue(ticket.getValue().toString().contains("sequence") && ticket.getValue().toString().contains("5"));
+        ArgumentCaptor<Bson> counter = ArgumentCaptor.forClass(Bson.class);
+        verify(sequences, times(2)).findOneAndUpdate(any(Bson.class), counter.capture(), any(FindOneAndUpdateOptions.class));
+        assertTrue(counter.getValue().toString().contains("$inc"));
     }
 
     @Test
-    @DisplayName("a subnet that overlaps an earlier active one removes itself and answers a duplicate that names the other range; a tie goes to the smaller id")
+    @DisplayName("a subnet that overlaps one with a lower ticket, or one with no ticket that is not being created (older than tickets), removes itself and answers a duplicate that names the other range")
     void createLoses() {
-        Instant now = Instant.parse("2026-10-19T10:00:00Z");
-        UUID small = UUID.fromString("10000000-0000-0000-0000-000000000001");
-        UUID large = UUID.fromString("20000000-0000-0000-0000-000000000001");
-        Subnet subnet = subnet("10.20.0.0/24", now, large);
-        finds(List.of(subnet("10.20.0.0/16", now.minusSeconds(1), UUID.randomUUID())), List.of(subnet("10.20.0.0/25", now, small)));
+        Instant now = Instant.now();
+        Subnet subnet = subnet("10.20.0.0/24", now, UUID.randomUUID());
+        Subnet legacy = subnet("10.20.0.0/25", now.minusSeconds(3600), UUID.randomUUID());
+        findsStored(List.of(stored(subnet("10.20.0.0/16", now, UUID.randomUUID()), 3L)), List.of(stored(legacy, null)));
         SubnetMongoRepositoryAdapter adapter = new SubnetMongoRepositoryAdapter(client, URI);
 
         StepVerifier.create(adapter.create(subnet)).expectErrorSatisfies(error -> {
             assertTrue(error instanceof DuplicateSubnetException);
             assertTrue(error.getMessage().contains("10.20.0.0/16"));
         }).verify();
-        StepVerifier.create(adapter.create(subnet)).expectError(DuplicateSubnetException.class).verify();
+        StepVerifier.create(adapter.create(subnet)).expectErrorSatisfies(error -> assertTrue(error.getMessage().contains("10.20.0.0/25"))).verify();
         verify(collection, times(2)).deleteOne(any(Bson.class));
-        assertTrue(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, small), subnet("10.0.0.0/24", now, large)));
-        assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, large), subnet("10.0.0.0/24", now, small)));
-        assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now.plusSeconds(1), small), subnet("10.0.0.0/24", now, large)));
-        Instant precise = now.plusNanos(900_000);
-        assertFalse(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now.plusNanos(400_000).truncatedTo(java.time.temporal.ChronoUnit.MILLIS), large),
-                subnet("10.0.0.0/24", precise, small)), "the same millisecond, read back from the store, is a tie decided by the id");
-        assertTrue(SubnetMongoRepositoryAdapter.isEarlier(subnet("10.0.0.0/24", now, small), subnet("10.0.0.0/24", precise, large)));
+    }
+
+    @Test
+    @DisplayName("a subnet being created right now (no ticket yet) is waited for: the read is repeated until it has one, and then the order decides")
+    void createWaitsForSubnetsBeingCreated() {
+        Instant now = Instant.now();
+        Subnet subnet = subnet("10.20.0.0/24", now, UUID.randomUUID());
+        Subnet beingCreated = subnet("10.20.0.0/16", now, UUID.randomUUID());
+        findsStored(List.of(stored(beingCreated, null)), List.of(stored(beingCreated, null)), List.of(stored(beingCreated, 9L)));
+        SubnetMongoRepositoryAdapter adapter = new SubnetMongoRepositoryAdapter(client, URI, Duration.ofMillis(1), 10);
+
+        StepVerifier.create(adapter.create(subnet)).expectNext(subnet).verifyComplete();
+
+        verify(collection, times(3)).find(any(Bson.class));
+        verify(collection, never()).deleteOne(any(Bson.class));
+    }
+
+    @Test
+    @DisplayName("a subnet that is still being created when the waiting runs out is treated as first: this one leaves")
+    void createGivesUpWaiting() {
+        Instant now = Instant.now();
+        Subnet subnet = subnet("10.20.0.0/24", now, UUID.randomUUID());
+        Subnet stuck = subnet("10.20.0.0/16", now, UUID.randomUUID());
+        findsStored(List.of(stored(stuck, null)));
+        SubnetMongoRepositoryAdapter adapter = new SubnetMongoRepositoryAdapter(client, URI, Duration.ofMillis(1), 2);
+
+        StepVerifier.create(adapter.create(subnet)).expectError(DuplicateSubnetException.class).verify();
+
+        verify(collection, times(3)).find(any(Bson.class));
+    }
+
+    @Test
+    @DisplayName("the counter is created by the first subnet; if two create it at once the loser asks again; any other failure passes through")
+    void ticketCounter() {
+        Subnet subnet = subnet("10.20.0.0/24");
+        findsStored(List.of());
+        MongoCommandException duplicate = new MongoCommandException(new BsonDocument("code", new BsonInt32(11000)).append("errmsg", new BsonString("dup")), new ServerAddress());
+        MongoCommandException other = new MongoCommandException(new BsonDocument("code", new BsonInt32(13)).append("errmsg", new BsonString("nope")), new ServerAddress());
+        when(sequences.findOneAndUpdate(any(Bson.class), any(Bson.class), any(FindOneAndUpdateOptions.class)))
+                .thenReturn(Mono.error(duplicate), Mono.just(new Document("value", 1L)), Mono.error(other), Mono.error(new IllegalStateException("down")));
+        SubnetMongoRepositoryAdapter adapter = new SubnetMongoRepositoryAdapter(client, URI);
+
+        StepVerifier.create(adapter.create(subnet)).expectNext(subnet).verifyComplete();
+        StepVerifier.create(adapter.create(subnet)).expectError(MongoCommandException.class).verify();
+        StepVerifier.create(adapter.create(subnet)).expectError(IllegalStateException.class).verify();
+        verify(sequences, times(4)).findOneAndUpdate(any(Bson.class), any(Bson.class), any(FindOneAndUpdateOptions.class));
     }
 
     @Test
